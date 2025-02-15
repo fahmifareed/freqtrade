@@ -9,6 +9,8 @@ import ccxt
 
 from freqtrade.constants import Config, PairWithTimeframe
 from freqtrade.enums.candletype import CandleType
+from freqtrade.exceptions import TemporaryError
+from freqtrade.exchange.common import retrier
 from freqtrade.exchange.exchange import timeframe_to_seconds
 from freqtrade.exchange.exchange_types import OHLCVResponse
 from freqtrade.util import dt_ts, format_ms_time, format_ms_time_det
@@ -20,7 +22,7 @@ logger = logging.getLogger(__name__)
 class ExchangeWS:
     def __init__(self, config: Config, ccxt_object: ccxt.Exchange) -> None:
         self.config = config
-        self.ccxt_object = ccxt_object
+        self._ccxt_object = ccxt_object
         self._background_tasks: set[asyncio.Task] = set()
 
         self._klines_watching: set[PairWithTimeframe] = set()
@@ -68,10 +70,10 @@ class ExchangeWS:
 
     async def _cleanup_async(self) -> None:
         try:
-            await self.ccxt_object.close()
+            await self._ccxt_object.close()
             # Clear the cache.
             # Not doing this will cause problems on startup with dynamic pairlists
-            self.ccxt_object.ohlcvs.clear()
+            self._ccxt_object.ohlcvs.clear()
         except Exception:
             logger.exception("Exception in _cleanup_async")
         finally:
@@ -81,7 +83,22 @@ class ExchangeWS:
         """
         Remove history for a pair/timeframe combination from ccxt cache
         """
-        self.ccxt_object.ohlcvs.get(paircomb[0], {}).pop(paircomb[1], None)
+        self._ccxt_object.ohlcvs.get(paircomb[0], {}).pop(paircomb[1], None)
+        self.klines_last_refresh.pop(paircomb, None)
+
+    @retrier(retries=3)
+    def ohlcvs(self, pair: str, timeframe: str) -> list[list]:
+        """
+        Returns a copy of the klines for a pair/timeframe combination
+        Note: this will only contain the data received from the websocket
+            so the data will build up over time.
+        """
+        try:
+            return deepcopy(self._ccxt_object.ohlcvs.get(pair, {}).get(timeframe, []))
+        except RuntimeError as e:
+            # Capture runtime errors and retry
+            # TemporaryError does not cause backoff - so we're essentially retrying immediately
+            raise TemporaryError(f"Error deepcopying: {e}") from e
 
     def cleanup_expired(self) -> None:
         """
@@ -122,6 +139,15 @@ class ExchangeWS:
                     )
                 )
 
+    async def _unwatch_ohlcv(self, pair: str, timeframe: str, candle_type: CandleType) -> None:
+        try:
+            await self._ccxt_object.un_watch_ohlcv_for_symbols([[pair, timeframe]])
+        except ccxt.NotSupported as e:
+            logger.debug("un_watch_ohlcv_for_symbols not supported: %s", e)
+            pass
+        except Exception:
+            logger.exception("Exception in _unwatch_ohlcv")
+
     def _continuous_stopped(
         self, task: asyncio.Task, pair: str, timeframe: str, candle_type: CandleType
     ):
@@ -134,6 +160,10 @@ class ExchangeWS:
                 result = str(result1)
 
         logger.info(f"{pair}, {timeframe}, {candle_type} - Task finished - {result}")
+        asyncio.run_coroutine_threadsafe(
+            self._unwatch_ohlcv(pair, timeframe, candle_type), loop=self._loop
+        )
+
         self._klines_scheduled.discard((pair, timeframe, candle_type))
         self._pop_history((pair, timeframe, candle_type))
 
@@ -143,7 +173,7 @@ class ExchangeWS:
         try:
             while (pair, timeframe, candle_type) in self._klines_watching:
                 start = dt_ts()
-                data = await self.ccxt_object.watch_ohlcv(pair, timeframe)
+                data = await self._ccxt_object.watch_ohlcv(pair, timeframe)
                 self.klines_last_refresh[(pair, timeframe, candle_type)] = dt_ts()
                 logger.debug(
                     f"watch done {pair}, {timeframe}, data {len(data)} "
@@ -178,7 +208,7 @@ class ExchangeWS:
         :param candle_ts: timestamp of the end-time of the candle we expect.
         """
         # Deepcopy the response - as it might be modified in the background as new messages arrive
-        candles = deepcopy(self.ccxt_object.ohlcvs.get(pair, {}).get(timeframe))
+        candles = self.ohlcvs(pair, timeframe)
         refresh_date = self.klines_last_refresh[(pair, timeframe, candle_type)]
         received_ts = candles[-1][0] if candles else 0
         drop_hint = received_ts >= candle_ts

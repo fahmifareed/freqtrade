@@ -12,7 +12,7 @@ from copy import deepcopy
 from datetime import datetime, timedelta, timezone
 from math import floor, isnan
 from threading import Lock
-from typing import Any, Literal, TypeGuard
+from typing import Any, Literal, TypeGuard, TypeVar
 
 import ccxt
 import ccxt.pro as ccxt_pro
@@ -113,6 +113,8 @@ from freqtrade.util.periodic_cache import PeriodicCache
 
 logger = logging.getLogger(__name__)
 
+T = TypeVar("T")
+
 
 class Exchange:
     # Parameters to add directly to buy/sell calls (like agreeing to trading agreement)
@@ -131,7 +133,6 @@ class Exchange:
         "stoploss_order_types": {},
         "order_time_in_force": ["GTC"],
         "ohlcv_params": {},
-        "ohlcv_candle_limit": 500,
         "ohlcv_has_history": True,  # Some exchanges (Kraken) don't provide history via ohlcv
         "ohlcv_partial_candle": True,
         "ohlcv_require_since": False,
@@ -276,6 +277,11 @@ class Exchange:
 
         logger.info(f'Using Exchange "{self.name}"')
         self.required_candle_call_count = 1
+        # Converts the interval provided in minutes in config to seconds
+        self.markets_refresh_interval: int = (
+            exchange_conf.get("markets_refresh_interval", 60) * 60 * 1000
+        )
+
         if validate:
             # Initial markets load
             self.reload_markets(True, load_leverage_tiers=False)
@@ -284,11 +290,6 @@ class Exchange:
             self.required_candle_call_count = self.validate_required_startup_candles(
                 self._startup_candle_count, config.get("timeframe", "")
             )
-
-        # Converts the interval provided in minutes in config to seconds
-        self.markets_refresh_interval: int = (
-            exchange_conf.get("markets_refresh_interval", 60) * 60 * 1000
-        )
 
         if self.trading_mode != TradingMode.SPOT and load_leverage_tiers:
             self.fill_leverage_tiers()
@@ -466,7 +467,12 @@ class Exchange:
         :return: Candle limit as integer
         """
 
-        fallback_val = self._ft_has.get("ohlcv_candle_limit")
+        ccxt_val = self.features(
+            "spot" if candle_type == CandleType.SPOT else "futures", "fetchOHLCV", "limit", 500
+        )
+        if not isinstance(ccxt_val, float | int):
+            ccxt_val = 500
+        fallback_val = self._ft_has.get("ohlcv_candle_limit", ccxt_val)
         if candle_type == CandleType.FUNDING_RATE:
             fallback_val = self._ft_has.get("funding_fee_candle_limit", fallback_val)
         return int(
@@ -642,7 +648,8 @@ class Exchange:
 
     def _load_async_markets(self, reload: bool = False) -> dict[str, Any]:
         try:
-            markets = self.loop.run_until_complete(self._api_reload_markets(reload=reload))
+            with self._loop_lock:
+                markets = self.loop.run_until_complete(self._api_reload_markets(reload=reload))
 
             if isinstance(markets, Exception):
                 raise markets
@@ -886,6 +893,24 @@ class Exchange:
         if endpoint in self._ft_has.get("exchange_has_overrides", {}):
             return self._ft_has["exchange_has_overrides"][endpoint]
         return endpoint in self._api_async.has and self._api_async.has[endpoint]
+
+    def features(
+        self, market_type: Literal["spot", "futures"], endpoint, attribute, default: T
+    ) -> T:
+        """
+        Returns the exchange features for the given markettype
+        https://docs.ccxt.com/#/README?id=features
+        attributes are in a nested dict, with spot and swap.linear
+        e.g. spot.fetchOHLCV.limit
+             swap.linear.fetchOHLCV.limit
+        """
+        feat = (
+            self._api_async.features.get("spot", {})
+            if market_type == "spot"
+            else self._api_async.features.get("swap", {}).get("linear", {})
+        )
+
+        return feat.get(endpoint, {}).get(attribute, default)
 
     def get_precision_amount(self, pair: str) -> float | None:
         """
@@ -2318,15 +2343,16 @@ class Exchange:
         :param until_ms: Timestamp in milliseconds to get history up to
         :return: Dataframe with candle (OHLCV) data
         """
-        pair, _, _, data, _ = self.loop.run_until_complete(
-            self._async_get_historic_ohlcv(
-                pair=pair,
-                timeframe=timeframe,
-                since_ms=since_ms,
-                until_ms=until_ms,
-                candle_type=candle_type,
+        with self._loop_lock:
+            pair, _, _, data, _ = self.loop.run_until_complete(
+                self._async_get_historic_ohlcv(
+                    pair=pair,
+                    timeframe=timeframe,
+                    since_ms=since_ms,
+                    until_ms=until_ms,
+                    candle_type=candle_type,
+                )
             )
-        )
         logger.debug(f"Downloaded data for {pair} from ccxt with length {len(data)}.")
         return ohlcv_to_dataframe(data, timeframe, pair, fill_missing=False, drop_incomplete=True)
 
@@ -2397,7 +2423,7 @@ class Exchange:
             if self._exchange_ws:
                 candle_ts = dt_ts(timeframe_to_prev_date(timeframe))
                 prev_candle_ts = dt_ts(date_minus_candles(timeframe, 1))
-                candles = self._exchange_ws.ccxt_object.ohlcvs.get(pair, {}).get(timeframe)
+                candles = self._exchange_ws.ohlcvs(pair, timeframe)
                 half_candle = int(candle_ts - (candle_ts - prev_candle_ts) * 0.5)
                 last_refresh_time = int(
                     self._exchange_ws.klines_last_refresh.get((pair, timeframe, candle_type), 0)
@@ -2960,7 +2986,7 @@ class Exchange:
             return trades[-1].get("timestamp")
 
     async def _async_get_trade_history_id_startup(
-        self, pair: str, since: int | None
+        self, pair: str, since: int
     ) -> tuple[list[list], str]:
         """
         override for initial trade_history_id call
@@ -2968,7 +2994,7 @@ class Exchange:
         return await self._async_fetch_trades(pair, since=since)
 
     async def _async_get_trade_history_id(
-        self, pair: str, until: int, since: int | None = None, from_id: str | None = None
+        self, pair: str, *, until: int, since: int, from_id: str | None = None
     ) -> tuple[str, list[list]]:
         """
         Asynchronously gets trade history using fetch_trades
@@ -3022,7 +3048,7 @@ class Exchange:
         return (pair, trades)
 
     async def _async_get_trade_history_time(
-        self, pair: str, until: int, since: int | None = None
+        self, pair: str, until: int, since: int
     ) -> tuple[str, list[list]]:
         """
         Asynchronously gets trade history using fetch_trades,
@@ -3063,7 +3089,7 @@ class Exchange:
     async def _async_get_trade_history(
         self,
         pair: str,
-        since: int | None = None,
+        since: int,
         until: int | None = None,
         from_id: str | None = None,
     ) -> tuple[str, list[list]]:
@@ -3094,7 +3120,7 @@ class Exchange:
     def get_historic_trades(
         self,
         pair: str,
-        since: int | None = None,
+        since: int,
         until: int | None = None,
         from_id: str | None = None,
     ) -> tuple[str, list]:
